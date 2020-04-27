@@ -1,0 +1,380 @@
+package pkg
+
+import (
+	"bytes"
+	"errors"
+	"fmt"
+	"go/ast"
+	"go/token"
+	"regexp"
+	"strings"
+	"text/template"
+
+	"github.com/jinzhu/inflection"
+	"golang.org/x/tools/go/packages"
+)
+
+// Provider refers to the kind of implementation that is choosen.
+type Provider string
+
+// TODO add Postgre, MongoDB, Cache Layer with Redis, etc.
+
+// MySQL is the only provider implementation by now.
+const MySQL Provider = "mysql"
+
+// LoaderInput holds the options of the new loader.
+type LoaderInput struct {
+	Pattern        []string
+	Type           string
+	TableName      string
+	OrderKey       string
+	CreatePageType bool
+	Expose         bool
+	Provider       Provider
+
+	packageName string
+}
+
+// BuildLoader returns the content of the new Loader.
+func BuildLoader(i LoaderInput) ([]byte, error) {
+	methods, err := parsePackage(&i)
+	if err != nil {
+		return nil, err
+	}
+
+	findTableName(&i)
+	findOrderKey(&i)
+
+	return buildDataLoaderContent(&i, methods), nil
+}
+
+// parsePackage checks if the type exists and validate that there is a valid
+// interface which has the form <TypeName>DataLoader. Does not matter if the
+// interface is exposed or not.
+// Returns the methods to be implemented or error if the type or the interface does
+// not exists.
+func parsePackage(i *LoaderInput) ([]string, error) {
+	var methods []string
+
+	if i.Type == "" {
+		return nil, errors.New("the type can not be empty")
+	}
+
+	cfg := &packages.Config{
+		Mode:  packages.LoadAllSyntax,
+		Tests: false,
+	}
+
+	pkgs, err := packages.Load(cfg, i.Pattern...)
+	if err != nil {
+		return nil, fmt.Errorf("could not load the package: %w", err)
+	}
+
+	if len(pkgs) != 1 {
+		return nil, fmt.Errorf("found %d packages", len(pkgs))
+	}
+
+	typeImpl := pkgs[0].Types.Scope().Lookup(i.Type)
+	if typeImpl == nil {
+		return nil, fmt.Errorf("could not find the given type in folder: %s", i.Type)
+	}
+
+	scope := pkgs[0].Types.Scope()
+	interfaceName := fmt.Sprintf("%sDataLoader", i.Type)
+	dataLoaderImp := scope.Lookup(interfaceName)
+	if dataLoaderImp == nil {
+		interfaceName = fmt.Sprintf("%sDataLoader", strings.ToLower(i.Type))
+		dataLoaderImp = scope.Lookup(interfaceName)
+		if dataLoaderImp == nil {
+			return nil, fmt.Errorf("could not found a data loader interface")
+		}
+	}
+
+	i.packageName = pkgs[0].Name
+
+	for _, file := range pkgs[0].Syntax {
+		for _, decl := range file.Decls {
+			d, ok := decl.(*ast.GenDecl)
+			if !ok || d.Tok != token.TYPE {
+				continue
+			}
+
+			for _, spec := range d.Specs {
+				tSpec := spec.(*ast.TypeSpec)
+				if tSpec.Name.Name == interfaceName {
+					ast.Inspect(tSpec, func(n ast.Node) bool {
+						if n == nil {
+							return true
+						}
+
+						tSpec, ok := n.(*ast.TypeSpec)
+						if !ok {
+							return true
+						}
+
+						tInterface, ok := tSpec.Type.(*ast.InterfaceType)
+						if !ok {
+							return true
+						}
+
+						for _, methodList := range tInterface.Methods.List {
+							methods = append(methods, methodList.Names[0].Name)
+						}
+
+						return false
+					})
+				}
+			}
+		}
+	}
+
+	return methods, nil
+}
+
+func buildDataLoaderContent(i *LoaderInput, methods []string) []byte {
+	var methodsMap = make(map[string]string, 0)
+
+	for _, method := range methods {
+		methodsMap[method] = method
+	}
+
+	contentToParse := baseTemplate
+
+	if _, ok := methodsMap["Create"]; ok {
+		contentToParse = fmt.Sprintf("%s%s", contentToParse, createMethod)
+	}
+
+	if _, ok := methodsMap["Update"]; ok {
+		contentToParse = fmt.Sprintf("%s%s", contentToParse, updateMethod)
+	}
+
+	if _, ok := methodsMap["Delete"]; ok {
+		contentToParse = fmt.Sprintf("%s%s", contentToParse, deleteMethod)
+	}
+
+	if _, ok := methodsMap["Find"]; ok {
+		contentToParse = fmt.Sprintf("%s%s", contentToParse, findMethod)
+	}
+
+	if _, ok := methodsMap["All"]; ok {
+		contentToParse = fmt.Sprintf("%s%s", contentToParse, allMethod)
+	}
+
+	tpl := template.New("file-content")
+	tpl, err := tpl.Parse(contentToParse)
+	if err != nil {
+		panic(err)
+	}
+
+	content := bytes.NewBuffer([]byte{})
+	if err = tpl.Execute(content, struct {
+		Package   string
+		Type      string
+		LowerType string
+		TableName string
+		OrderKey  string
+	}{
+		Package:   i.packageName,
+		Type:      i.Type,
+		LowerType: strings.ToLower(i.Type[:1]) + i.Type[1:],
+		TableName: i.TableName,
+		OrderKey:  i.OrderKey,
+	}); err != nil {
+		panic(err)
+	}
+
+	return content.Bytes()
+}
+
+// findTableName sets the table name, if the input already has one it won't change.
+func findTableName(i *LoaderInput) {
+	if i.TableName != "" {
+		return
+	}
+
+	i.TableName = toSnakeCase(inflection.Plural(i.Type))
+}
+
+// findOrderKey sets the key to paginate, if it's empty "id" will be selected.
+func findOrderKey(i *LoaderInput) {
+	if i.OrderKey == "" {
+		i.OrderKey = "id"
+	}
+}
+
+var matchFirstCap = regexp.MustCompile("(.)([A-Z][a-z]+)")
+var matchAllCap = regexp.MustCompile("([a-z0-9])([A-Z])")
+
+func toSnakeCase(str string) string {
+	snake := matchFirstCap.ReplaceAllString(str, "${1}_${2}")
+	snake = matchAllCap.ReplaceAllString(snake, "${1}_${2}")
+	return strings.ToLower(snake)
+}
+
+var baseTemplate = `// Code generated by github.com/lapix-com-co/dataloader; do not edit!
+
+package {{.Package}}
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"strconv"
+
+	"github.com/jinzhu/gorm"
+	"github.com/lapix-com-co/dataloader/pkg"
+	"github.com/lapix-com-co/dataloader/pkg/slice"
+	"github.com/lapix-com-co/dataloader/pkg/pagination"
+	local "github.com/lapix-com-co/dataloader/pkg/gorm"
+)
+
+type {{.Type}}Page struct {
+	Nodes    []*{{.Type}}
+	PageInfo pagination.Output
+}
+
+type {{.LowerType}}MySQLDataLoader struct {
+	db        *gorm.DB
+	tableName string
+	sortKey   string
+}
+
+func New{{.Type}}MySQLDataLoader(db *gorm.DB) *{{.LowerType}}MySQLDataLoader {
+	return &{{.LowerType}}MySQLDataLoader{
+		db:        db,
+		tableName: "{{.TableName}}",
+		sortKey:   "{{.OrderKey}}",
+	}
+}
+`
+
+var createMethod = `
+func (r *{{.LowerType}}MySQLDataLoader) Create(ctx context.Context, {{.LowerType}} *{{.Type}}) error {
+	if err := local.Create(ctx, r.queryTable(), {{.LowerType}}); err != nil {
+		return fmt.Errorf("could not create the item: %w", err)
+	}
+
+	return nil
+}
+`
+
+var updateMethod = `
+func (r *{{.LowerType}}MySQLDataLoader) Update(ctx context.Context, {{.LowerType}} *{{.Type}}) error {
+	if {{.LowerType}}.ID == 0 {
+		return errors.New("could not update the item because it does not have a valid ID")
+	}
+
+	if err := local.Save(ctx, r.queryTable(), {{.LowerType}}); err != nil {
+		return fmt.Errorf("could not update the item: %w", err)
+	}
+
+	return nil
+}
+`
+
+var deleteMethod = `
+func (r *{{.LowerType}}MySQLDataLoader) Delete(ctx context.Context, {{.LowerType}} *{{.Type}}) error {
+	if err := local.Delete(ctx, r.queryTable(), {{.LowerType}}); err != nil {
+		return fmt.Errorf("could not delete the item: %w", err)
+	}
+
+	return nil
+}
+`
+
+var findMethod = `
+func (r *{{.LowerType}}MySQLDataLoader) Find(ctx context.Context, i []uint) ([]*{{.Type}}, error) {
+	elements := make([]*{{.Type}}, 0)
+	if len(i) == 0 {
+		return elements, nil
+	}
+
+	if err := local.Find(ctx, r.queryTable().Where("id IN (?)", i), &elements); err != nil {
+		if errors.Is(err, pkg.ErrRecordNotFound) {
+			return nil, err
+		}
+
+		return nil, fmt.Errorf("could not find the item: %w", err)
+	}
+
+	return elements, nil
+}
+`
+
+var allMethod = `
+func (r *{{.LowerType}}MySQLDataLoader) All(ctx context.Context, i pagination.Input) (*{{.Type}}Page, error) {
+	return r.paginateElements(ctx, r.queryTable(), i)
+}
+
+func (r *{{.LowerType}}MySQLDataLoader) paginateElements(ctx context.Context, query *gorm.DB, i pagination.Input) (*{{.Type}}Page, error) {
+	elements := make([]*{{.Type}}, 0)
+	total, err := local.Count(ctx, query)
+	if err != nil {
+		return nil, fmt.Errorf("could not count the total items: %w", err)
+	}
+
+	if total == 0 {
+		return create{{.Type}}PageInfo(elements, 0, i), nil
+	}
+
+	if err = local.Find(ctx, r.applyPaginationToQuery(query, i), &elements); err != nil {
+		return nil, fmt.Errorf("could not query the items: %w", err)
+	}
+
+	if i.Last != nil {
+		slice.Reverse(elements)
+	}
+
+	return create{{.Type}}PageInfo(elements, total, i), nil
+}
+
+func (r *{{.LowerType}}MySQLDataLoader) applyPaginationToQuery(query *gorm.DB, input pagination.Input) *gorm.DB {
+	if input.After != nil {
+		query = query.Where(fmt.Sprintf("%s > ?", r.sortKey), *input.After)
+	} else if input.Before != nil {
+		query = query.Where(fmt.Sprintf("%s < ?", r.sortKey), *input.Before)
+	}
+
+	if input.Last != nil {
+		query = query.Order(fmt.Sprintf("%s DESC", r.sortKey)).Limit(*input.Last)
+	} else if input.First != nil {
+		query = query.Order(fmt.Sprintf("%s ASC", r.sortKey)).Limit(*input.First)
+	}
+
+	return query
+}
+
+func (r *{{.LowerType}}MySQLDataLoader) queryTable() *gorm.DB {
+	return r.db.New().Table(r.tableName)
+}
+
+func create{{.Type}}PageInfo(items []*{{.Type}}, totalItems uint32, input pagination.Input) *{{.Type}}Page {
+	var page = &{{.Type}}Page{Nodes: items}
+	var pageLength = len(items)
+	var pageInfo = pagination.Output{
+		Total:           totalItems,
+		HasNextPage:     true,
+		HasPreviousPage: true,
+	}
+
+	if pageLength > 0 {
+		startCursorID := strconv.Itoa(int(items[0].ID))
+		endCursorID := strconv.Itoa(int(items[pageLength-1].ID))
+
+		pageInfo.StartCursor = &startCursorID
+		pageInfo.EndCursor = &endCursorID
+	}
+
+	if input.Last != nil {
+		pageInfo.HasPreviousPage = uint16(pageLength) == *input.Last
+		pageInfo.HasNextPage = false
+	} else if input.First != nil {
+		pageInfo.HasPreviousPage = false
+		pageInfo.HasNextPage = uint16(pageLength) == *input.First
+	}
+
+	page.PageInfo = pageInfo
+
+	return page
+}
+`

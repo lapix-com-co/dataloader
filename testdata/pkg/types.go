@@ -20,6 +20,7 @@ type petDataLoader interface {
 	Update(context.Context, *Pet) error
 	Delete(context.Context, *Pet) error
 	Find(context.Context, []string) ([]*Pet, error)
+	FindOne(context.Context, string) (*Pet, error)
 	All(context.Context, pagination.Input) (*PetPage, error)
 
 	// Dataloader does not know about this method, it will be skiped.

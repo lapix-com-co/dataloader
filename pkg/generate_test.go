@@ -43,7 +43,8 @@ type petDataLoader interface {
 	Create(context.Context, *Pet) error
 	Update(context.Context, *Pet) error
 	Delete(context.Context, *Pet) error
-	Find(context.Context, []string) ([]*Pet, error)
+	Find(context.Context, []uint) ([]*Pet, error)
+	FindOne(context.Context, uint) (*Pet, error)
 	All(context.Context, dataloader.Input) (*PetPage, error)
 
 	// Dataloader does not know about this method, it will be skiped.
@@ -62,14 +63,15 @@ import (
 	"strconv"
 
 	"github.com/jinzhu/gorm"
-	"github.com/lapix-com-co/dataloader"
-	local "github.com/lapix-com-co/dataloader/gorm"
-	"github.com/lapix-com-co/dataloader/slice"
+	"github.com/lapix-com-co/dataloader/pkg"
+	"github.com/lapix-com-co/dataloader/pkg/slice"
+	"github.com/lapix-com-co/dataloader/pkg/pagination"
+	local "github.com/lapix-com-co/dataloader/pkg/gorm"
 )
 
 type PetPage struct {
 	Nodes    []*Pet
-	PageInfo dataloader.Output
+	PageInfo pagination.Output
 }
 
 type petMySQLDataLoader struct {
@@ -121,7 +123,7 @@ func (r *petMySQLDataLoader) Find(ctx context.Context, i []uint) ([]*Pet, error)
 	}
 
 	if err := local.Find(ctx, r.queryTable().Where("id IN (?)", i), &elements); err != nil {
-		if errors.Is(err, dataloader.ErrRecordNotFound) {
+		if errors.Is(err, pkg.ErrRecordNotFound) {
 			return nil, err
 		}
 
@@ -131,11 +133,22 @@ func (r *petMySQLDataLoader) Find(ctx context.Context, i []uint) ([]*Pet, error)
 	return elements, nil
 }
 
-func (r *petMySQLDataLoader) All(ctx context.Context, i dataloader.Input) (*PetPage, error) {
+func (r *petMySQLDataLoader) FindOne(ctx context.Context, i uint) (*Pet, error) {
+	elements, err := r.Find(ctx, []uint{i})
+	if err != nil {
+		return nil, err
+	}
+	if len(elements) == 0 {
+		return nil, fmt.Errorf("%w: '%d'", pkg.ErrNotFound, i)
+	}
+	return elements[0], nil
+}
+
+func (r *petMySQLDataLoader) All(ctx context.Context, i pagination.Input) (*PetPage, error) {
 	return r.paginateElements(ctx, r.queryTable(), i)
 }
 
-func (r *petMySQLDataLoader) paginateElements(ctx context.Context, query *gorm.DB, i dataloader.Input) (*PetPage, error) {
+func (r *petMySQLDataLoader) paginateElements(ctx context.Context, query *gorm.DB, i pagination.Input) (*PetPage, error) {
 	elements := make([]*Pet, 0)
 	total, err := local.Count(ctx, query)
 	if err != nil {
@@ -157,7 +170,7 @@ func (r *petMySQLDataLoader) paginateElements(ctx context.Context, query *gorm.D
 	return createPetPageInfo(elements, total, i), nil
 }
 
-func (r *petMySQLDataLoader) applyPaginationToQuery(query *gorm.DB, input dataloader.Input) *gorm.DB {
+func (r *petMySQLDataLoader) applyPaginationToQuery(query *gorm.DB, input pagination.Input) *gorm.DB {
 	if input.After != nil {
 		query = query.Where(fmt.Sprintf("%s > ?", r.sortKey), *input.After)
 	} else if input.Before != nil {
@@ -173,14 +186,10 @@ func (r *petMySQLDataLoader) applyPaginationToQuery(query *gorm.DB, input datalo
 	return query
 }
 
-func (r *petMySQLDataLoader) queryTable() *gorm.DB {
-	return r.db.New().Table(r.tableName)
-}
-
-func createPetPageInfo(items []*Pet, totalItems uint32, input dataloader.Input) *PetPage {
+func createPetPageInfo(items []*Pet, totalItems uint32, input pagination.Input) *PetPage {
 	var page = &PetPage{Nodes: items}
 	var pageLength = len(items)
-	var pageInfo = dataloader.Output{
+	var pageInfo = pagination.Output{
 		Total:           totalItems,
 		HasNextPage:     true,
 		HasPreviousPage: true,
@@ -205,6 +214,10 @@ func createPetPageInfo(items []*Pet, totalItems uint32, input dataloader.Input) 
 	page.PageInfo = pageInfo
 
 	return page
+}
+
+func (r *petMySQLDataLoader) queryTable() *gorm.DB {
+	return r.db.New().Table(r.tableName)
 }
 `
 

@@ -56,6 +56,13 @@ func main() {
 		log.Fatal("Find() method did not pull any data")
 	}
 
+	// Find an item.
+	petFromDB, err := loader.FindOne(ctx, myPet.ID)
+	check(err)
+	if petFromDB == nil {
+		log.Fatal("FindOne() method did not pull any data")
+	}
+
 	// Pull all the items.
 	page, err := loader.All(ctx, pagination.Input{First: u(1)})
 	check(err)
